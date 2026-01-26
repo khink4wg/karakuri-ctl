@@ -9,6 +9,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import yaml
+
 # Support both package and direct execution
 try:
     from .profile import Profile, ServiceConfig
@@ -80,22 +82,63 @@ class DockerManager:
             self.default_compose_file = project_root / "docker-compose.yaml"
         # Config directory for external settings
         self.config_dir = project_root / "config"
-        # Skills directory
-        self.skills_dir = project_root / "skills"
+        # Infrastructure directory
+        self.infrastructure_dir = project_root / "infrastructure"
+        # Source directory (skills are in src/<skill_name>/)
+        self.src_dir = project_root / "src"
+        # Skills catalog (loaded from infrastructure/skills.yaml)
+        self._skills_catalog: Optional[Dict] = None
+
+    def _load_skills_catalog(self) -> Dict:
+        """Load skills catalog from infrastructure/skills.yaml.
+
+        Returns:
+            Dict with 'skills' key containing tier -> skill list mapping
+        """
+        if self._skills_catalog is not None:
+            return self._skills_catalog
+
+        skills_file = self.infrastructure_dir / "skills.yaml"
+        if not skills_file.exists():
+            self._skills_catalog = {"skills": {}}
+            return self._skills_catalog
+
+        with open(skills_file, "r") as f:
+            self._skills_catalog = yaml.safe_load(f) or {"skills": {}}
+        return self._skills_catalog
+
+    def get_skill_tier(self, skill_name: str) -> Optional[str]:
+        """Get the tier for a skill from the skills catalog.
+
+        Args:
+            skill_name: Name of the skill
+
+        Returns:
+            Tier name (e.g., 'low_level', 'high_level', 'execution') or None if not found
+        """
+        catalog = self._load_skills_catalog()
+        skills = catalog.get("skills", {})
+        for tier, skill_list in skills.items():
+            if skill_name in skill_list:
+                return tier
+        return None
+
+    def get_all_skills(self) -> Dict[str, List[str]]:
+        """Get all skills grouped by tier.
+
+        Returns:
+            Dict mapping tier name to list of skill names
+        """
+        catalog = self._load_skills_catalog()
+        return catalog.get("skills", {})
 
     def get_skill_compose_file(self, skill_name: str, tier: str = "low_level") -> Optional[Path]:
         """Get the docker-compose.yml path for a skill.
 
-        Skills are organized as:
-        - skills/low_level/<skill_name>/docker-compose.yml
-        - skills/high_level/<skill_name>/docker-compose.yml
+        Skills are located at:
+        - src/<skill_name>/docker-compose.yml
         """
-        skill_path = self.skills_dir / tier / skill_name / "docker-compose.yml"
-        if skill_path.exists():
-            return skill_path
-        # Try other tier
-        other_tier = "high_level" if tier == "low_level" else "low_level"
-        skill_path = self.skills_dir / other_tier / skill_name / "docker-compose.yml"
+        skill_path = self.src_dir / skill_name / "docker-compose.yml"
         if skill_path.exists():
             return skill_path
         return None
@@ -251,19 +294,17 @@ class DockerManager:
         if "HOST_PROJECT_ROOT" not in run_env:
             run_env["HOST_PROJECT_ROOT"] = str(self.project_root)
 
-        # Find all skill docker-compose.yml files
+        # Get skills from catalog (infrastructure/skills.yaml)
+        all_skills = self.get_all_skills()
         skill_compose_files = []
-        for tier in ["low_level", "high_level", "execution"]:
-            tier_dir = self.skills_dir / tier
-            if tier_dir.exists():
-                for skill_dir in tier_dir.iterdir():
-                    if skill_dir.is_dir() or skill_dir.is_symlink():
-                        compose_file = skill_dir / "docker-compose.yml"
-                        if compose_file.exists():
-                            skill_compose_files.append((skill_dir.name, compose_file))
+        for tier, skill_list in all_skills.items():
+            for skill_name in skill_list:
+                compose_file = self.src_dir / skill_name / "docker-compose.yml"
+                if compose_file.exists():
+                    skill_compose_files.append((skill_name, tier, compose_file))
 
         # Get status for each skill
-        for skill_name, compose_file in skill_compose_files:
+        for skill_name, tier, compose_file in skill_compose_files:
             try:
                 result = subprocess.run(
                     ["docker", "compose", "-f", str(compose_file), "ps", "--format", "json", "-a"],
@@ -463,6 +504,16 @@ class DockerManager:
 
         # Build docker compose command
         cmd = ["docker", "compose", "-f", str(compose_file)]
+
+        # Add --env-file options for .env and config/*.env files
+        env_file = self.project_root / ".env"
+        if env_file.exists():
+            cmd.extend(["--env-file", str(env_file)])
+
+        # Add config/ads.env if exists
+        ads_env_file = self.config_dir / "ads.env"
+        if ads_env_file.exists():
+            cmd.extend(["--env-file", str(ads_env_file)])
 
         if profile:
             cmd.extend(["--profile", profile])
