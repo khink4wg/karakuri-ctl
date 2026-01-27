@@ -448,10 +448,103 @@ class DockerManager:
         return True
 
     def stop_all(self, compose_files: Optional[List[str]] = None) -> bool:
-        """Stop all running containers."""
+        """Stop all running containers.
+
+        If compose_files is specified, uses those files.
+        Otherwise, discovers all running containers started by docker compose
+        and stops them using their original compose files.
+        """
+        if compose_files:
+            # Use specified compose files
+            try:
+                self._run_compose(["down"], compose_files=compose_files)
+                return True
+            except subprocess.CalledProcessError:
+                return False
+
+        # Discover all running containers and their compose files
         try:
-            self._run_compose(["down"], compose_files=compose_files)
-            return True
+            result = subprocess.run(
+                ["docker", "ps", "--format", "{{.ID}}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            container_ids = result.stdout.strip().split("\n")
+            container_ids = [c for c in container_ids if c]
+
+            if not container_ids:
+                print("No running containers found.")
+                return True
+
+            # Group containers by their compose file
+            # Only include containers whose compose file is under the project root
+            project_root_str = str(self.project_root)
+            compose_configs: dict[str, dict] = {}
+            for container_id in container_ids:
+                try:
+                    result = subprocess.run(
+                        ["docker", "inspect", container_id,
+                         "--format", "{{index .Config.Labels \"com.docker.compose.project.config_files\"}}|{{index .Config.Labels \"com.docker.compose.project.environment_file\"}}|{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}|{{index .Config.Labels \"com.docker.compose.project\"}}"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    parts = result.stdout.strip().split("|")
+                    if len(parts) >= 4 and parts[0]:
+                        config_file = parts[0]
+                        env_files = parts[1] if parts[1] else ""
+                        working_dir = parts[2] if parts[2] else ""
+                        project_name = parts[3] if parts[3] else ""
+
+                        # Only include containers from this project
+                        if not config_file.startswith(project_root_str):
+                            continue
+
+                        if config_file and config_file not in compose_configs:
+                            compose_configs[config_file] = {
+                                "env_files": env_files,
+                                "working_dir": working_dir,
+                                "project_name": project_name,
+                            }
+                except subprocess.CalledProcessError:
+                    continue
+
+            if not compose_configs:
+                # No compose-managed containers, try default
+                try:
+                    self._run_compose(["down"])
+                    return True
+                except subprocess.CalledProcessError:
+                    return False
+
+            # Stop each compose project
+            success = True
+            for config_file, config in compose_configs.items():
+                project_name = config.get("project_name", "")
+                print(f"  Stopping project: {project_name} ({config_file})")
+
+                cmd = ["docker", "compose", "-f", config_file]
+
+                # Add environment files
+                env_files = config.get("env_files", "")
+                if env_files:
+                    for env_file in env_files.split(","):
+                        env_file = env_file.strip()
+                        if env_file and Path(env_file).exists():
+                            cmd.extend(["--env-file", env_file])
+
+                cmd.append("down")
+
+                try:
+                    working_dir = config.get("working_dir") or str(self.project_root)
+                    subprocess.run(cmd, cwd=working_dir, check=True)
+                except subprocess.CalledProcessError:
+                    print(f"    Failed to stop {project_name}")
+                    success = False
+
+            return success
+
         except subprocess.CalledProcessError:
             return False
 
