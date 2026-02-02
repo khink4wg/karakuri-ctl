@@ -84,12 +84,17 @@ def convert_new_profile_to_legacy(config: dict) -> Profile:
         "infrastructure/docker/docker-compose.skills.yml",
     ])
 
-    # Build environment from ROS settings and other top-level env
+    # Build environment from ROS settings and explicit environment section
     environment = {}
     ros_settings = config.get("ros", {})
     if ros_settings:
         environment["ROS_DOMAIN_ID"] = str(ros_settings.get("domain_id", 10))
         environment["RMW_IMPLEMENTATION"] = ros_settings.get("rmw_implementation", "rmw_fastrtps_cpp")
+
+    # Merge explicit environment section (overrides ros settings)
+    explicit_env = config.get("environment", {})
+    if explicit_env:
+        environment.update(explicit_env)
 
     return Profile(
         name=config.get("name", "unknown"),
