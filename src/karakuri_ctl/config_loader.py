@@ -106,6 +106,26 @@ class ConfigLoader:
         if isinstance(obj, str):
             return self._expand_string(obj, context)
         elif isinstance(obj, dict):
+            # Support reference expansion for dicts.
+            # Example:
+            #   environment:
+            #     $ref: env.ros2_control_skill_env
+            #     EXTRA: value
+            if "$ref" in obj:
+                ref_path = obj.get("$ref")
+                ref_value = self._get_nested_value(context, ref_path) if ref_path else None
+                if ref_value is None:
+                    return {}
+                if isinstance(ref_value, dict):
+                    expanded_ref = self._expand_variables(ref_value, context)
+                    merged = dict(expanded_ref)
+                    # Merge remaining keys (override reference)
+                    for key, value in obj.items():
+                        if key == "$ref":
+                            continue
+                        merged[key] = self._expand_variables(value, context)
+                    return merged
+                return ref_value
             return {k: self._expand_variables(v, context) for k, v in obj.items()}
         elif isinstance(obj, list):
             return [self._expand_variables(item, context) for item in obj]

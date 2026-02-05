@@ -84,6 +84,13 @@ def convert_new_profile_to_legacy(config: dict) -> Profile:
         "infrastructure/docker/docker-compose.skills.yml",
     ])
 
+    # Get env_files (string or list)
+    env_files_raw = config.get("env_files", [])
+    if isinstance(env_files_raw, str):
+        env_files = [env_files_raw]
+    else:
+        env_files = list(env_files_raw)
+
     # Build environment from ROS settings and explicit environment section
     environment = {}
     ros_settings = config.get("ros", {})
@@ -100,6 +107,7 @@ def convert_new_profile_to_legacy(config: dict) -> Profile:
         name=config.get("name", "unknown"),
         description=config.get("description", ""),
         compose_files=compose_files,
+        env_files=env_files,
         environment=environment,
         services=services,
     )
@@ -170,7 +178,8 @@ def cmd_down(args, docker: DockerManager, legacy_profiles: ProfileManager,
         if config and is_skill_based_profile(config):
             print(f"{Colors.CYAN}Stopping skill-based profile: {args.profile}{Colors.RESET}")
             skills = config.get("skills", [])
-            docker.stop_skill_profile(skills)
+            env_files = config.get("env_files", [])
+            docker.stop_skill_profile(skills, env_files=env_files)
             return 0
 
         # Legacy infrastructure profile

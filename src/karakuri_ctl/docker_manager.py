@@ -143,18 +143,26 @@ class DockerManager:
             return skill_path
         return None
 
-    def load_external_config(self) -> Dict[str, str]:
-        """Load external configuration from config/*.env files.
+    def _resolve_env_files(self, env_files: Optional[List[str]]) -> List[Path]:
+        """Resolve env file paths relative to project_root."""
+        resolved: List[Path] = []
+        if not env_files:
+            return resolved
+        for env_file in env_files:
+            path = Path(env_file)
+            if not path.is_absolute():
+                path = self.project_root / path
+            if path.exists():
+                resolved.append(path)
+            else:
+                print(f"  Warning: env file not found: {env_file}")
+        return resolved
 
-        Currently loads:
-        - config/ads.env: ADS connection settings
-        """
-        env = {}
-        # Load ADS config if exists
-        ads_env_file = self.config_dir / "ads.env"
-        if ads_env_file.exists():
-            ads_env = load_env_file(ads_env_file)
-            env.update(ads_env)
+    def _load_env_files(self, env_files: Optional[List[str]]) -> Dict[str, str]:
+        """Load environment variables from a list of env files."""
+        env: Dict[str, str] = {}
+        for env_path in self._resolve_env_files(env_files):
+            env.update(load_env_file(env_path))
         return env
 
     def _build_compose_cmd(self, compose_files: Optional[List[str]] = None) -> List[str]:
@@ -185,12 +193,15 @@ class DockerManager:
         self,
         args: List[str],
         compose_files: Optional[List[str]] = None,
+        env_files: Optional[List[str]] = None,
         env: Optional[Dict[str, str]] = None,
         capture_output: bool = False,
         check: bool = True,
     ) -> subprocess.CompletedProcess:
         """Run docker compose command."""
         cmd = self._build_compose_cmd(compose_files)
+        for env_path in self._resolve_env_files(env_files):
+            cmd.extend(["--env-file", str(env_path)])
         cmd.extend(args)
 
         run_env = os.environ.copy()
@@ -343,6 +354,7 @@ class DockerManager:
         self,
         service: ServiceConfig,
         compose_files: Optional[List[str]] = None,
+        env_files: Optional[List[str]] = None,
         env: Optional[Dict[str, str]] = None,
         detach: bool = True,
         wait: bool = False,
@@ -356,15 +368,20 @@ class DockerManager:
         args.append(service.name)
 
         try:
-            self._run_compose(args, compose_files=compose_files, env=env)
+            self._run_compose(args, compose_files=compose_files, env_files=env_files, env=env)
             return True
         except subprocess.CalledProcessError:
             return False
 
-    def stop_service(self, service_name: str, compose_files: Optional[List[str]] = None) -> bool:
+    def stop_service(
+        self,
+        service_name: str,
+        compose_files: Optional[List[str]] = None,
+        env_files: Optional[List[str]] = None,
+    ) -> bool:
         """Stop a single service."""
         try:
-            self._run_compose(["stop", service_name], compose_files=compose_files)
+            self._run_compose(["stop", service_name], compose_files=compose_files, env_files=env_files)
             return True
         except subprocess.CalledProcessError:
             return False
@@ -375,9 +392,9 @@ class DockerManager:
         verbose: bool = False,
     ) -> bool:
         """Start all services in a profile."""
-        # Load external config first (e.g., config/ads.env)
-        env = self.load_external_config()
-        # Profile environment overrides external config
+        # Load environment from env_files first, then apply profile overrides
+        env_files = profile.env_files if profile.env_files else None
+        env = self._load_env_files(env_files)
         env.update(profile.environment)
 
         # Get ordered services
@@ -389,6 +406,8 @@ class DockerManager:
         print(f"Starting profile: {profile.name}")
         if compose_files:
             print(f"  Compose files: {compose_files}")
+        if env_files:
+            print(f"  Env files: {env_files}")
         print(f"  Environment: {env}")
         print(f"  Services: {[s.name for s in ordered]}")
         print()
@@ -402,6 +421,7 @@ class DockerManager:
             success = self.start_service(
                 svc,
                 compose_files=compose_files,
+                env_files=env_files,
                 env=svc_env,
                 detach=True,
                 wait=svc.wait_for_healthy,
@@ -436,13 +456,14 @@ class DockerManager:
         """Stop all services in a profile (reverse order)."""
         ordered = profile.get_ordered_services()
         compose_files = profile.compose_files if profile.compose_files else None
+        env_files = profile.env_files if profile.env_files else None
 
         print(f"Stopping profile: {profile.name}")
 
         # Stop in reverse order
         for svc in reversed(ordered):
             print(f"  Stopping {svc.name}...", end=" ", flush=True)
-            success = self.stop_service(svc.name, compose_files=compose_files)
+            success = self.stop_service(svc.name, compose_files=compose_files, env_files=env_files)
             print("OK" if success else "FAILED")
 
         return True
@@ -569,6 +590,7 @@ class DockerManager:
         skill_name: str,
         tier: str = "low_level",
         env: Optional[Dict[str, str]] = None,
+        env_files: Optional[List[str]] = None,
         profile: Optional[str] = None,
         wait: bool = True,
     ) -> bool:
@@ -598,15 +620,10 @@ class DockerManager:
         # Build docker compose command
         cmd = ["docker", "compose", "-f", str(compose_file)]
 
-        # Add --env-file options for .env and config/*.env files
-        env_file = self.project_root / ".env"
-        if env_file.exists():
-            cmd.extend(["--env-file", str(env_file)])
-
-        # Add config/ads.env if exists
-        ads_env_file = self.config_dir / "ads.env"
-        if ads_env_file.exists():
-            cmd.extend(["--env-file", str(ads_env_file)])
+        # Add --env-file options (default to .env when not provided)
+        effective_env_files = env_files if env_files else [".env"]
+        for env_path in self._resolve_env_files(effective_env_files):
+            cmd.extend(["--env-file", str(env_path)])
 
         if profile:
             cmd.extend(["--profile", profile])
@@ -615,16 +632,13 @@ class DockerManager:
         if wait:
             cmd.append("--wait")
 
-        # Merge external config with provided env
+        # Merge env files with provided env
         run_env = os.environ.copy()
-        # Load .env file for HOST_PROJECT_ROOT (needed for DooD compatibility)
-        env_file = self.project_root / ".env"
-        if env_file.exists():
-            run_env.update(load_env_file(env_file))
+        # Load env files for HOST_PROJECT_ROOT (needed for DooD compatibility)
+        run_env.update(self._load_env_files(effective_env_files))
         # Fallback to project_root if HOST_PROJECT_ROOT not in .env
         if "HOST_PROJECT_ROOT" not in run_env:
             run_env["HOST_PROJECT_ROOT"] = str(self.project_root)
-        run_env.update(self.load_external_config())
         if env:
             run_env.update(env)
 
@@ -645,6 +659,7 @@ class DockerManager:
         self,
         skill_name: str,
         tier: str = "low_level",
+        env_files: Optional[List[str]] = None,
         profile: Optional[str] = None,
     ) -> bool:
         """Stop a skill.
@@ -666,6 +681,9 @@ class DockerManager:
         print(f"Stopping skill: {skill_name}")
 
         cmd = ["docker", "compose", "-f", str(compose_file)]
+        effective_env_files = env_files if env_files else [".env"]
+        for env_path in self._resolve_env_files(effective_env_files):
+            cmd.extend(["--env-file", str(env_path)])
         if profile:
             cmd.extend(["--profile", profile])
         cmd.append("down")
@@ -740,25 +758,16 @@ class DockerManager:
             True if all skills started successfully
         """
         # Load environment from files
-        run_env = {}
-        if env_files:
-            for env_file in env_files:
-                env_path = self.project_root / env_file
-                if env_path.exists():
-                    run_env.update(load_env_file(env_path))
-                else:
-                    print(f"  Warning: env file not found: {env_file}")
-
-        # Load external config (config/*.env)
-        run_env.update(self.load_external_config())
+        effective_env_files = env_files if env_files else [".env"]
+        run_env = self._load_env_files(effective_env_files)
 
         # Add global environment
         if env:
             run_env.update(env)
 
         print(f"Starting {len(skills)} skill(s)...")
-        if env_files:
-            print(f"  Env files: {env_files}")
+        if effective_env_files:
+            print(f"  Env files: {effective_env_files}")
 
         for skill_config in skills:
             skill_name = skill_config.get("name")
@@ -778,6 +787,7 @@ class DockerManager:
                 skill_name=skill_name,
                 tier=tier,
                 env=merged_env,
+                env_files=effective_env_files,
                 profile=compose_profile,
                 wait=wait,
             )
@@ -792,6 +802,7 @@ class DockerManager:
     def stop_skill_profile(
         self,
         skills: List[Dict],
+        env_files: Optional[List[str]] = None,
     ) -> bool:
         """Stop multiple skills (in reverse order).
 
@@ -803,6 +814,7 @@ class DockerManager:
         """
         print(f"Stopping {len(skills)} skill(s)...")
 
+        effective_env_files = env_files if env_files else [".env"]
         # Stop in reverse order
         for skill_config in reversed(skills):
             skill_name = skill_config.get("name")
@@ -810,7 +822,12 @@ class DockerManager:
             compose_profile = skill_config.get("compose_profile")
 
             print(f"  Stopping {skill_name}...", end=" ", flush=True)
-            success = self.stop_skill(skill_name, tier, compose_profile)
+            success = self.stop_skill(
+                skill_name,
+                tier,
+                env_files=effective_env_files,
+                profile=compose_profile,
+            )
             print("OK" if success else "FAILED")
 
         return True
