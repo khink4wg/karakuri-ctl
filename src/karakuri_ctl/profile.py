@@ -24,6 +24,7 @@ class Profile:
     name: str
     description: str = ""
     compose_files: List[str] = field(default_factory=list)
+    env_files: List[str] = field(default_factory=list)
     environment: Dict[str, str] = field(default_factory=dict)
     services: List[ServiceConfig] = field(default_factory=list)
 
@@ -53,10 +54,18 @@ class Profile:
         else:
             compose_files = list(compose_files_raw)
 
+        # Parse env_files - can be string or list
+        env_files_raw = data.get("env_files", [])
+        if isinstance(env_files_raw, str):
+            env_files = [env_files_raw]
+        else:
+            env_files = list(env_files_raw)
+
         return cls(
             name=data.get("name", path.stem),
             description=data.get("description", ""),
             compose_files=compose_files,
+            env_files=env_files,
             environment=data.get("environment", {}),
             services=services,
         )

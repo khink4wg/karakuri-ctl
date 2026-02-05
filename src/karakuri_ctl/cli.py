@@ -84,17 +84,30 @@ def convert_new_profile_to_legacy(config: dict) -> Profile:
         "infrastructure/docker/docker-compose.skills.yml",
     ])
 
-    # Build environment from ROS settings and other top-level env
+    # Get env_files (string or list)
+    env_files_raw = config.get("env_files", [])
+    if isinstance(env_files_raw, str):
+        env_files = [env_files_raw]
+    else:
+        env_files = list(env_files_raw)
+
+    # Build environment from ROS settings and explicit environment section
     environment = {}
     ros_settings = config.get("ros", {})
     if ros_settings:
         environment["ROS_DOMAIN_ID"] = str(ros_settings.get("domain_id", 10))
         environment["RMW_IMPLEMENTATION"] = ros_settings.get("rmw_implementation", "rmw_fastrtps_cpp")
 
+    # Merge explicit environment section (overrides ros settings)
+    explicit_env = config.get("environment", {})
+    if explicit_env:
+        environment.update(explicit_env)
+
     return Profile(
         name=config.get("name", "unknown"),
         description=config.get("description", ""),
         compose_files=compose_files,
+        env_files=env_files,
         environment=environment,
         services=services,
     )
@@ -165,7 +178,8 @@ def cmd_down(args, docker: DockerManager, legacy_profiles: ProfileManager,
         if config and is_skill_based_profile(config):
             print(f"{Colors.CYAN}Stopping skill-based profile: {args.profile}{Colors.RESET}")
             skills = config.get("skills", [])
-            docker.stop_skill_profile(skills)
+            env_files = config.get("env_files", [])
+            docker.stop_skill_profile(skills, env_files=env_files)
             return 0
 
         # Legacy infrastructure profile
