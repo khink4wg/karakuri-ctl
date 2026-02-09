@@ -1,6 +1,6 @@
 """Main CLI for karakuri-ctl.
 
-Updated to support the new infrastructure-based configuration system.
+Skill-based architecture: all profiles use 1 skill = 1 docker-compose.yml.
 """
 
 import argparse
@@ -14,11 +14,9 @@ import yaml
 # Support both package and direct execution
 try:
     from .docker_manager import DockerManager, ServiceState
-    from .profile import ProfileManager, Profile, ServiceConfig
     from .config_loader import ProfileLoader
 except ImportError:
     from docker_manager import DockerManager, ServiceState
-    from profile import ProfileManager, Profile, ServiceConfig
     from config_loader import ProfileLoader
 
 
@@ -59,143 +57,44 @@ def find_project_root() -> Path:
     return current
 
 
-def is_skill_based_profile(config: dict) -> bool:
-    """Check if profile uses skill-based architecture (1 skill = 1 docker-compose.yml)."""
-    return config.get("profile_type") == "skill"
-
-
-def convert_new_profile_to_legacy(config: dict) -> Profile:
-    """Convert new profile format to legacy Profile object."""
-    services = []
-    for skill in config.get("skills", []):
-        if isinstance(skill, dict):
-            services.append(ServiceConfig(
-                name=skill.get("name", ""),
-                depends_on=skill.get("depends_on", []),
-                wait_for_healthy=skill.get("wait_for_healthy", False),
-                environment=skill.get("environment", {}),
-            ))
-        else:
-            services.append(ServiceConfig(name=skill))
-
-    # Get compose files from profile or use defaults
-    compose_files = config.get("compose_files", [
-        "docker-compose.yml",
-        "infrastructure/docker/docker-compose.skills.yml",
-    ])
-
-    # Get env_files (string or list)
-    env_files_raw = config.get("env_files", [])
-    if isinstance(env_files_raw, str):
-        env_files = [env_files_raw]
-    else:
-        env_files = list(env_files_raw)
-
-    # Build environment from ROS settings and explicit environment section
-    environment = {}
-    ros_settings = config.get("ros", {})
-    if ros_settings:
-        environment["ROS_DOMAIN_ID"] = str(ros_settings.get("domain_id", 10))
-        environment["RMW_IMPLEMENTATION"] = ros_settings.get("rmw_implementation", "rmw_fastrtps_cpp")
-
-    # Merge explicit environment section (overrides ros settings)
-    explicit_env = config.get("environment", {})
-    if explicit_env:
-        environment.update(explicit_env)
-
-    return Profile(
-        name=config.get("name", "unknown"),
-        description=config.get("description", ""),
-        compose_files=compose_files,
-        env_files=env_files,
-        environment=environment,
-        services=services,
-    )
-
-
-def cmd_up(args, docker: DockerManager, legacy_profiles: ProfileManager,
-           new_profiles: Optional[ProfileLoader]) -> int:
+def cmd_up(args, docker: DockerManager, profiles: ProfileLoader) -> int:
     """Start a profile."""
-    config = None
-
-    # Try new infrastructure profiles first
-    if new_profiles:
-        try:
-            config = new_profiles.load_profile(args.profile)
-        except FileNotFoundError:
-            pass
-
-    # Check if it's a skill-based profile
-    if config and is_skill_based_profile(config):
-        print(f"{Colors.CYAN}Using skill-based profile: {args.profile}{Colors.RESET}")
-
-        # Extract skill configurations
-        skills = config.get("skills", [])
-        env_files = config.get("env_files", [])
-
-        # Build global environment from ROS settings
-        env = {}
-        ros_settings = config.get("ros", {})
-        if ros_settings:
-            env["ROS_DOMAIN_ID"] = str(ros_settings.get("domain_id", 10))
-            env["RMW_IMPLEMENTATION"] = ros_settings.get("rmw_implementation", "rmw_fastrtps_cpp")
-
-        success = docker.start_skill_profile(skills, env=env, env_files=env_files)
-        return 0 if success else 1
-
-    # Legacy infrastructure profile
-    if config:
-        profile = convert_new_profile_to_legacy(config)
-        print(f"{Colors.CYAN}Using infrastructure profile: {args.profile}{Colors.RESET}")
-        success = docker.start_profile(profile, verbose=args.verbose)
-        return 0 if success else 1
-
-    # Fall back to legacy profiles
     try:
-        profile = legacy_profiles.load_profile(args.profile)
-        print(f"{Colors.GRAY}Using legacy profile: {args.profile}{Colors.RESET}")
-        success = docker.start_profile(profile, verbose=args.verbose)
-        return 0 if success else 1
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
+        config = profiles.load_profile(args.profile)
+    except FileNotFoundError:
+        print(f"Error: Profile '{args.profile}' not found")
         return 1
 
+    print(f"{Colors.CYAN}Starting profile: {args.profile}{Colors.RESET}")
 
-def cmd_down(args, docker: DockerManager, legacy_profiles: ProfileManager,
-             new_profiles: Optional[ProfileLoader]) -> int:
+    skills = config.get("skills", [])
+    env_files = config.get("env_files", [])
+
+    # Build global environment from ROS settings
+    env = {}
+    ros_settings = config.get("ros", {})
+    if ros_settings:
+        env["ROS_DOMAIN_ID"] = str(ros_settings.get("domain_id", 10))
+        env["RMW_IMPLEMENTATION"] = ros_settings.get("rmw_implementation", "rmw_fastrtps_cpp")
+
+    success = docker.start_skill_profile(skills, env=env, env_files=env_files)
+    return 0 if success else 1
+
+
+def cmd_down(args, docker: DockerManager, profiles: ProfileLoader) -> int:
     """Stop services."""
     if args.profile:
-        config = None
-
-        # Try new infrastructure profiles first
-        if new_profiles:
-            try:
-                config = new_profiles.load_profile(args.profile)
-            except FileNotFoundError:
-                pass
-
-        # Check if it's a skill-based profile
-        if config and is_skill_based_profile(config):
-            print(f"{Colors.CYAN}Stopping skill-based profile: {args.profile}{Colors.RESET}")
-            skills = config.get("skills", [])
-            env_files = config.get("env_files", [])
-            docker.stop_skill_profile(skills, env_files=env_files)
-            return 0
-
-        # Legacy infrastructure profile
-        if config:
-            profile = convert_new_profile_to_legacy(config)
-            docker.stop_profile(profile)
-            return 0
-
-        # Fall back to legacy profiles
         try:
-            profile = legacy_profiles.load_profile(args.profile)
-            docker.stop_profile(profile)
-            return 0
-        except FileNotFoundError as e:
-            print(f"Error: {e}")
+            config = profiles.load_profile(args.profile)
+        except FileNotFoundError:
+            print(f"Error: Profile '{args.profile}' not found")
             return 1
+
+        print(f"{Colors.CYAN}Stopping profile: {args.profile}{Colors.RESET}")
+        skills = config.get("skills", [])
+        env_files = config.get("env_files", [])
+        docker.stop_skill_profile(skills, env_files=env_files)
+        return 0
     else:
         print("Stopping all services...")
         docker.stop_all()
@@ -203,8 +102,7 @@ def cmd_down(args, docker: DockerManager, legacy_profiles: ProfileManager,
     return 0
 
 
-def cmd_status(args, docker: DockerManager, legacy_profiles: ProfileManager,
-               new_profiles: Optional[ProfileLoader]) -> int:
+def cmd_status(args, docker: DockerManager, profiles: ProfileLoader) -> int:
     """Show status of all services."""
     statuses = docker.get_all_status()
 
@@ -224,89 +122,41 @@ def cmd_status(args, docker: DockerManager, legacy_profiles: ProfileManager,
     return 0
 
 
-def cmd_profiles(args, docker: DockerManager, legacy_profiles: ProfileManager,
-                 new_profiles: Optional[ProfileLoader]) -> int:
+def cmd_profiles(args, docker: DockerManager, profiles: ProfileLoader) -> int:
     """List available profiles."""
     print(f"\n{Colors.BOLD}Available profiles:{Colors.RESET}\n")
 
-    # List new infrastructure profiles
-    if new_profiles:
-        profile_names = new_profiles.list_profiles()
-        if profile_names:
-            print(f"  {Colors.CYAN}Infrastructure profiles:{Colors.RESET}")
-            for name in profile_names:
-                try:
-                    info = new_profiles.get_profile_info(name)
-                    desc = info.get("description", "")
-                    skills = info.get("skills", [])
-                    print(f"    {Colors.BLUE}{name}{Colors.RESET}")
-                    if desc:
-                        print(f"      {desc}")
-                    print(f"      Skills: {', '.join(skills)}")
-                    print()
-                except Exception as e:
-                    print(f"    {Colors.RED}{name}{Colors.RESET} (error: {e})")
-            print()
-
-    # List legacy profiles
-    legacy_names = legacy_profiles.list_profiles()
-    if legacy_names:
-        print(f"  {Colors.GRAY}Legacy profiles:{Colors.RESET}")
-        for name in legacy_names:
+    profile_names = profiles.list_profiles()
+    if profile_names:
+        for name in profile_names:
             try:
-                info = legacy_profiles.get_profile_info(name)
+                info = profiles.get_profile_info(name)
                 desc = info.get("description", "")
-                services = info.get("services", [])
-                print(f"    {Colors.GRAY}{name}{Colors.RESET}")
+                skills = info.get("skills", [])
+                print(f"  {Colors.BLUE}{name}{Colors.RESET}")
                 if desc:
-                    print(f"      {desc}")
-                print(f"      Services: {', '.join(services)}")
+                    print(f"    {desc}")
+                print(f"    Skills: {', '.join(skills)}")
                 print()
             except Exception as e:
-                print(f"    {Colors.RED}{name}{Colors.RESET} (error: {e})")
+                print(f"  {Colors.RED}{name}{Colors.RESET} (error: {e})")
+    else:
+        print("  No profiles found.")
 
     return 0
 
 
-def cmd_show(args, docker: DockerManager, legacy_profiles: ProfileManager,
-             new_profiles: Optional[ProfileLoader]) -> int:
+def cmd_show(args, docker: DockerManager, profiles: ProfileLoader) -> int:
     """Show expanded profile configuration."""
-    config = None
+    try:
+        config = profiles.load_profile(args.profile)
+        print(f"{Colors.CYAN}# Profile: {args.profile}{Colors.RESET}")
+        print(f"{Colors.CYAN}# Fully expanded configuration:{Colors.RESET}\n")
+    except FileNotFoundError:
+        print(f"Error: Profile '{args.profile}' not found")
+        return 1
 
-    # Try new infrastructure profiles first
-    if new_profiles:
-        try:
-            config = new_profiles.load_profile(args.profile)
-            print(f"{Colors.CYAN}# Infrastructure profile: {args.profile}{Colors.RESET}")
-            print(f"{Colors.CYAN}# Fully expanded configuration:{Colors.RESET}\n")
-        except FileNotFoundError:
-            pass
-
-    # Fall back to legacy profiles
-    if config is None:
-        try:
-            profile = legacy_profiles.load_profile(args.profile)
-            config = {
-                "name": profile.name,
-                "description": profile.description,
-                "compose_files": profile.compose_files,
-                "environment": profile.environment,
-                "services": [
-                    {
-                        "name": s.name,
-                        "depends_on": s.depends_on,
-                        "wait_for_healthy": s.wait_for_healthy,
-                        "environment": s.environment,
-                    }
-                    for s in profile.services
-                ],
-            }
-            print(f"{Colors.GRAY}# Legacy profile: {args.profile}{Colors.RESET}\n")
-        except FileNotFoundError as e:
-            print(f"Error: {e}")
-            return 1
-
-    # Output as YAML
+    # Output as YAML or JSON
     if args.format == "json":
         print(json.dumps(config, indent=2, ensure_ascii=False))
     else:
@@ -315,8 +165,7 @@ def cmd_show(args, docker: DockerManager, legacy_profiles: ProfileManager,
     return 0
 
 
-def cmd_logs(args, docker: DockerManager, legacy_profiles: ProfileManager,
-             new_profiles: Optional[ProfileLoader]) -> int:
+def cmd_logs(args, docker: DockerManager, profiles: ProfileLoader) -> int:
     """Show logs for a service."""
     docker.logs(args.service, follow=args.follow, tail=args.tail)
     return 0
@@ -390,16 +239,12 @@ def main(argv: Optional[list] = None) -> int:
     else:
         project_root = find_project_root()
 
-    # Initialize profile managers
-    # Legacy profiles (project_root/profiles/)
-    legacy_profiles_dir = project_root / "profiles"
-    legacy_profile_mgr = ProfileManager(legacy_profiles_dir)
-
-    # New infrastructure profiles (project_root/infrastructure/)
+    # Initialize profile loader (infrastructure profiles only)
     infrastructure_path = project_root / "infrastructure"
-    new_profile_mgr = None
-    if infrastructure_path.is_dir():
-        new_profile_mgr = ProfileLoader(infrastructure_path)
+    if not infrastructure_path.is_dir():
+        print(f"Error: infrastructure directory not found at {infrastructure_path}")
+        return 1
+    profile_loader = ProfileLoader(infrastructure_path)
 
     # Initialize Docker manager
     docker = DockerManager(project_root)
@@ -407,9 +252,9 @@ def main(argv: Optional[list] = None) -> int:
     # Handle profiles subcommand
     if args.command == "profiles":
         if hasattr(args, "profiles_cmd") and args.profiles_cmd == "show":
-            return cmd_show(args, docker, legacy_profile_mgr, new_profile_mgr)
+            return cmd_show(args, docker, profile_loader)
         else:
-            return cmd_profiles(args, docker, legacy_profile_mgr, new_profile_mgr)
+            return cmd_profiles(args, docker, profile_loader)
 
     # Dispatch command
     commands = {
@@ -423,7 +268,7 @@ def main(argv: Optional[list] = None) -> int:
 
     handler = commands.get(args.command)
     if handler:
-        return handler(args, docker, legacy_profile_mgr, new_profile_mgr)
+        return handler(args, docker, profile_loader)
     else:
         parser.print_help()
         return 1

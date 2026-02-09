@@ -1,21 +1,17 @@
-"""Docker Compose management for karakuri-ctl."""
+"""Docker Compose management for karakuri-ctl.
+
+Skill-based architecture: 1 skill = 1 docker-compose.yml
+"""
 
 import json
 import os
 import subprocess
-import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import yaml
-
-# Support both package and direct execution
-try:
-    from .profile import Profile, ServiceConfig
-except ImportError:
-    from profile import Profile, ServiceConfig
 
 
 def load_env_file(path: Path) -> Dict[str, str]:
@@ -71,7 +67,7 @@ class ServiceStatus:
 
 
 class DockerManager:
-    """Manages Docker Compose operations."""
+    """Manages Docker Compose operations for skill-based architecture."""
 
     def __init__(self, project_root: Path, project_name: str = "ws"):
         self.project_root = project_root
@@ -217,43 +213,6 @@ class DockerManager:
             check=check,
         )
 
-    def get_service_status(self, service_name: str, compose_files: Optional[List[str]] = None) -> ServiceStatus:
-        """Get status of a single service."""
-        try:
-            result = self._run_compose(
-                ["ps", "--format", "json", service_name],
-                compose_files=compose_files,
-                capture_output=True,
-                check=False,
-            )
-
-            if result.returncode != 0 or not result.stdout.strip():
-                return ServiceStatus(name=service_name, state=ServiceState.NOT_FOUND)
-
-            # Parse JSON output (one line per container)
-            for line in result.stdout.strip().split("\n"):
-                if not line:
-                    continue
-                data = json.loads(line)
-                state_str = data.get("State", "").lower()
-                try:
-                    state = ServiceState(state_str)
-                except ValueError:
-                    state = ServiceState.NOT_FOUND
-
-                return ServiceStatus(
-                    name=service_name,
-                    state=state,
-                    container_id=data.get("ID"),
-                    health=data.get("Health"),
-                    ports=data.get("Publishers"),
-                )
-
-            return ServiceStatus(name=service_name, state=ServiceState.NOT_FOUND)
-
-        except Exception:
-            return ServiceStatus(name=service_name, state=ServiceState.NOT_FOUND)
-
     def get_all_status(self, compose_files: Optional[List[str]] = None) -> List[ServiceStatus]:
         """Get status of all services including skill-based containers."""
         statuses = []
@@ -349,124 +308,6 @@ class DockerManager:
                 pass
 
         return statuses
-
-    def start_service(
-        self,
-        service: ServiceConfig,
-        compose_files: Optional[List[str]] = None,
-        env_files: Optional[List[str]] = None,
-        env: Optional[Dict[str, str]] = None,
-        detach: bool = True,
-        wait: bool = False,
-    ) -> bool:
-        """Start a single service."""
-        args = ["up"]
-        if detach:
-            args.append("-d")
-        if wait:
-            args.append("--wait")
-        args.append(service.name)
-
-        try:
-            self._run_compose(args, compose_files=compose_files, env_files=env_files, env=env)
-            return True
-        except subprocess.CalledProcessError:
-            return False
-
-    def stop_service(
-        self,
-        service_name: str,
-        compose_files: Optional[List[str]] = None,
-        env_files: Optional[List[str]] = None,
-    ) -> bool:
-        """Stop a single service."""
-        try:
-            self._run_compose(["stop", service_name], compose_files=compose_files, env_files=env_files)
-            return True
-        except subprocess.CalledProcessError:
-            return False
-
-    def start_profile(
-        self,
-        profile: Profile,
-        verbose: bool = False,
-    ) -> bool:
-        """Start all services in a profile."""
-        # Load environment from env_files first, then apply profile overrides
-        env_files = profile.env_files if profile.env_files else None
-        env = self._load_env_files(env_files)
-        env.update(profile.environment)
-
-        # Get ordered services
-        ordered = profile.get_ordered_services()
-
-        # Get compose files from profile
-        compose_files = profile.compose_files if profile.compose_files else None
-
-        print(f"Starting profile: {profile.name}")
-        if compose_files:
-            print(f"  Compose files: {compose_files}")
-        if env_files:
-            print(f"  Env files: {env_files}")
-        print(f"  Environment: {env}")
-        print(f"  Services: {[s.name for s in ordered]}")
-        print()
-
-        for svc in ordered:
-            # Merge service-specific environment
-            svc_env = {**env, **svc.environment}
-
-            print(f"  Starting {svc.name}...", end=" ", flush=True)
-
-            success = self.start_service(
-                svc,
-                compose_files=compose_files,
-                env_files=env_files,
-                env=svc_env,
-                detach=True,
-                wait=svc.wait_for_healthy,
-            )
-
-            if not success:
-                print("FAILED")
-                return False
-
-            # Wait for container to be running
-            for _ in range(30):
-                status = self.get_service_status(svc.name, compose_files=compose_files)
-                if status.state == ServiceState.RUNNING:
-                    print("OK")
-                    break
-                time.sleep(1)
-            else:
-                print(f"TIMEOUT (state: {status.state})")
-                if not svc.wait_for_healthy:
-                    # Continue anyway if not waiting for health
-                    pass
-
-            # Add delay between services for startup
-            if svc.depends_on:
-                time.sleep(2)
-
-        print()
-        print("Profile started successfully.")
-        return True
-
-    def stop_profile(self, profile: Profile) -> bool:
-        """Stop all services in a profile (reverse order)."""
-        ordered = profile.get_ordered_services()
-        compose_files = profile.compose_files if profile.compose_files else None
-        env_files = profile.env_files if profile.env_files else None
-
-        print(f"Stopping profile: {profile.name}")
-
-        # Stop in reverse order
-        for svc in reversed(ordered):
-            print(f"  Stopping {svc.name}...", end=" ", flush=True)
-            success = self.stop_service(svc.name, compose_files=compose_files, env_files=env_files)
-            print("OK" if success else "FAILED")
-
-        return True
 
     def stop_all(self, compose_files: Optional[List[str]] = None) -> bool:
         """Stop all running containers.
