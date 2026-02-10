@@ -171,6 +171,19 @@ def cmd_logs(args, docker: DockerManager, profiles: ProfileLoader) -> int:
     return 0
 
 
+def cmd_exec(args, docker: DockerManager, profiles: ProfileLoader) -> int:
+    """Execute command in a running skill container with ROS/workspace bootstrap."""
+    exec_command = list(args.exec_command or [])
+    if exec_command and exec_command[0] == "--":
+        exec_command = exec_command[1:]
+
+    return docker.exec_skill(
+        skill_name=args.skill,
+        command=exec_command if exec_command else None,
+        bootstrap_ros_ws=True,
+    )
+
+
 def main(argv: Optional[list] = None) -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -227,6 +240,18 @@ def main(argv: Optional[list] = None) -> int:
     logs_parser.add_argument("-f", "--follow", action="store_true", help="Follow log output")
     logs_parser.add_argument("-n", "--tail", type=int, default=100, help="Number of lines")
 
+    # exec command
+    exec_parser = subparsers.add_parser(
+        "exec",
+        help="Execute command in running skill container (auto source ROS/workspace)",
+    )
+    exec_parser.add_argument("skill", help="Skill/service name (e.g. ros2_control_skill)")
+    exec_parser.add_argument(
+        "exec_command",
+        nargs=argparse.REMAINDER,
+        help="Command tokens. Use '-- <cmd ...>'",
+    )
+
     args = parser.parse_args(argv)
 
     if not args.command:
@@ -264,6 +289,7 @@ def main(argv: Optional[list] = None) -> int:
         "profiles": cmd_profiles,
         "show": cmd_show,
         "logs": cmd_logs,
+        "exec": cmd_exec,
     }
 
     handler = commands.get(args.command)

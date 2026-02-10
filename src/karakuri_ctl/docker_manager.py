@@ -5,7 +5,9 @@ Skill-based architecture: 1 skill = 1 docker-compose.yml
 
 import json
 import os
+import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -672,3 +674,96 @@ class DockerManager:
             print("OK" if success else "FAILED")
 
         return True
+
+    def exec_skill(
+        self,
+        skill_name: str,
+        command: Optional[List[str]] = None,
+        tier: str = "low_level",
+        env_files: Optional[List[str]] = None,
+        bootstrap_ros_ws: bool = True,
+    ) -> int:
+        """Execute a command inside a running skill container.
+
+        Args:
+            skill_name: Name of the skill (also used as compose service name)
+            command: Command tokens to execute. If omitted, opens interactive shell.
+            tier: Skill tier (reserved for future; compose is resolved by skill name)
+            env_files: Env files for docker compose resolution
+            bootstrap_ros_ws: Source ROS and workspace overlays before command
+
+        Returns:
+            Process return code from docker compose exec
+        """
+        compose_file = self.get_skill_compose_file(skill_name, tier)
+        if not compose_file:
+            print(f"Error: docker-compose.yml not found for skill '{skill_name}'")
+            return 1
+
+        skill_dir = compose_file.parent
+        container_id = self._find_running_skill_container(skill_name, skill_dir)
+        if not container_id:
+            print(
+                f"Error: running container not found for skill '{skill_name}'. "
+                f"Start it first with 'karakuri-ctl up <profile>'."
+            )
+            return 1
+
+        cmd = ["docker", "exec"]
+        # Interactive shell only when requested and TTY is available.
+        if command is None and sys.stdin.isatty() and sys.stdout.isatty():
+            cmd.append("-it")
+        cmd.extend([container_id, "bash", "-lc"])
+
+        script_lines: List[str] = []
+        if bootstrap_ros_ws:
+            script_lines.extend([
+                'source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash" >/dev/null 2>&1 || true',
+                'if [ -f /workspace/install/setup.bash ]; then source /workspace/install/setup.bash >/dev/null 2>&1 || true; fi',
+                'if [ -f /workspace/install/local_setup.bash ]; then source /workspace/install/local_setup.bash >/dev/null 2>&1 || true; fi',
+                'if [ -f /ros2_ws/install/setup.bash ]; then source /ros2_ws/install/setup.bash >/dev/null 2>&1 || true; fi',
+                'if [ -f /ros2_ws/install/local_setup.bash ]; then source /ros2_ws/install/local_setup.bash >/dev/null 2>&1 || true; fi',
+            ])
+
+        if command:
+            script_lines.append(shlex.join(command))
+        else:
+            script_lines.append("exec bash -i")
+
+        cmd.append("\n".join(script_lines))
+
+        result = subprocess.run(
+            cmd,
+            check=False,
+        )
+        return result.returncode
+
+    def _find_running_skill_container(self, skill_name: str, skill_dir: Path) -> Optional[str]:
+        """Find running container ID for a skill service."""
+        queries = [
+            [
+                "docker", "ps",
+                "--filter", f"label=com.docker.compose.service={skill_name}",
+                "--filter", f"label=com.docker.compose.project.working_dir={skill_dir}",
+                "--format", "{{.ID}}",
+            ],
+            [
+                "docker", "ps",
+                "--filter", f"label=com.docker.compose.service={skill_name}",
+                "--format", "{{.ID}}",
+            ],
+        ]
+
+        for query in queries:
+            result = subprocess.run(
+                query,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                continue
+            ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            if ids:
+                return ids[0]
+        return None

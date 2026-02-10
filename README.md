@@ -22,6 +22,13 @@ karakuri-ctl status
 
 # Stop
 karakuri-ctl down
+
+# Execute command inside running skill container
+# (automatically sources ROS + workspace overlays)
+karakuri-ctl exec ros2_control_skill -- ros2 topic list
+
+# Open interactive shell with bootstrap
+karakuri-ctl exec ros2_control_skill
 ```
 
 ## Configuration
