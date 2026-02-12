@@ -3,6 +3,7 @@
 Skill-based architecture: 1 skill = 1 docker-compose.yml
 """
 
+import concurrent.futures
 import json
 import os
 import shlex
@@ -586,19 +587,10 @@ class DockerManager:
     ) -> bool:
         """Start multiple skills from a skill-based profile.
 
-        Args:
-            skills: List of skill configurations with keys:
-                - name: Skill name (required)
-                - tier: Skill tier (default: 'low_level')
-                - compose_profile: Docker Compose profile (e.g., 'ads')
-                - depends_on: List of skill names to wait for
-                - wait_for_healthy: Wait for health check
-                - environment: Additional environment variables
-            env: Global environment variables
-            env_files: List of env files to load (e.g., ['config/ads.env'])
-
-        Returns:
-            True if all skills started successfully
+        Startup rules:
+        - Respect ``depends_on`` as a strict dependency graph.
+        - Start independent skills in parallel.
+        - A skill used as dependency is forced to wait until healthy/ready.
         """
         # Load environment from files
         effective_env_files = env_files if env_files else [".env"]
@@ -612,35 +604,109 @@ class DockerManager:
         if effective_env_files:
             print(f"  Env files: {effective_env_files}")
 
-        for skill_config in skills:
+        # Index and validate skills.
+        skill_by_name: Dict[str, Dict] = {}
+        order_map: Dict[str, int] = {}
+        for idx, skill_config in enumerate(skills):
             skill_name = skill_config.get("name")
-            tier = skill_config.get("tier", "low_level")
-            compose_profile = skill_config.get("compose_profile")
-            wait = skill_config.get("wait_for_healthy", True)
-            skill_env = skill_config.get("environment", {})
+            if not skill_name:
+                print("  Error: skill entry without 'name' found")
+                return False
+            if skill_name in skill_by_name:
+                print(f"  Error: duplicate skill name '{skill_name}' in profile")
+                return False
+            skill_by_name[skill_name] = skill_config
+            order_map[skill_name] = idx
 
-            # Merge environments
-            merged_env = {**run_env, **skill_env}
+        dependents: Dict[str, set] = {name: set() for name in skill_by_name}
+        for skill_name, skill_config in skill_by_name.items():
+            deps = skill_config.get("depends_on", []) or []
+            missing_deps = [dep for dep in deps if dep not in skill_by_name]
+            if missing_deps:
+                print(
+                    f"  Error: skill '{skill_name}' depends on undefined skills: "
+                    f"{', '.join(missing_deps)}"
+                )
+                return False
+            for dep in deps:
+                dependents[dep].add(skill_name)
 
-            print(f"\n  Starting skill: {skill_name}")
-            if compose_profile:
-                print(f"    Compose profile: {compose_profile}")
+        started = set()
+        while len(started) < len(skill_by_name):
+            ready_batch = [
+                name for name, cfg in skill_by_name.items()
+                if name not in started
+                and all(dep in started for dep in (cfg.get("depends_on", []) or []))
+            ]
 
-            success = self.start_skill(
-                skill_name=skill_name,
-                tier=tier,
-                env=merged_env,
-                env_files=effective_env_files,
-                profile=compose_profile,
-                wait=wait,
+            if not ready_batch:
+                remaining = [name for name in skill_by_name if name not in started]
+                print(
+                    "  Error: dependency cycle or unresolved dependency detected. "
+                    f"Remaining skills: {', '.join(remaining)}"
+                )
+                return False
+
+            ready_batch.sort(key=lambda n: order_map[n])
+            print(
+                "\n  Starting batch (parallel): "
+                + ", ".join(ready_batch)
             )
 
-            if not success:
-                print(f"  Failed to start skill: {skill_name}")
+            futures = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(ready_batch)) as executor:
+                for skill_name in ready_batch:
+                    skill_config = skill_by_name[skill_name]
+                    tier = skill_config.get("tier", "low_level")
+                    compose_profile = skill_config.get("compose_profile")
+                    wait = skill_config.get("wait_for_healthy", True)
+                    skill_env = skill_config.get("environment", {})
+
+                    # Enforce readiness for any dependency skill so downstream services
+                    # start only after prerequisites are really up.
+                    effective_wait = wait
+                    if dependents[skill_name] and not wait:
+                        print(
+                            f"    Note: forcing wait_for_healthy=true for dependency "
+                            f"skill '{skill_name}'"
+                        )
+                        effective_wait = True
+
+                    merged_env = {**run_env, **skill_env}
+
+                    print(f"    Queue start: {skill_name}")
+                    if compose_profile:
+                        print(f"      Compose profile: {compose_profile}")
+
+                    futures[
+                        executor.submit(
+                            self.start_skill,
+                            skill_name=skill_name,
+                            tier=tier,
+                            env=merged_env,
+                            env_files=effective_env_files,
+                            profile=compose_profile,
+                            wait=effective_wait,
+                        )
+                    ] = skill_name
+
+                failed_skills = []
+                for future in concurrent.futures.as_completed(futures):
+                    skill_name = futures[future]
+                    success = future.result()
+                    if success:
+                        started.add(skill_name)
+                    else:
+                        failed_skills.append(skill_name)
+
+            if failed_skills:
+                failed_skills.sort(key=lambda n: order_map[n])
+                print(f"  Failed to start skill(s): {', '.join(failed_skills)}")
                 return False
 
         print("\nAll skills started successfully.")
         return True
+
 
     def stop_skill_profile(
         self,

@@ -39,6 +39,13 @@ karakuri-ctl looks for configuration in `infrastructure/` directory:
 - `infrastructure/environments/` - Environment configurations
 - `infrastructure/robots/` - Robot-specific configurations
 
+## Startup Orchestration
+
+- `depends_on` は厳密に解決されます（未定義依存・循環依存はエラー）。
+- 依存関係のないスキルは同一バッチで並列起動されます。
+- 他スキルから依存されるスキルは、`wait_for_healthy: false` が設定されていても
+  起動完了待ち（`--wait`）が強制されます。
+
 ## License
 
 Apache-2.0
