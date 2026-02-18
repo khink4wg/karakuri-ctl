@@ -9,6 +9,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -789,20 +790,111 @@ class DockerManager:
                 'if [ -f /workspace/install/local_setup.bash ]; then source /workspace/install/local_setup.bash >/dev/null 2>&1 || true; fi',
                 'if [ -f /ros2_ws/install/setup.bash ]; then source /ros2_ws/install/setup.bash >/dev/null 2>&1 || true; fi',
                 'if [ -f /ros2_ws/install/local_setup.bash ]; then source /ros2_ws/install/local_setup.bash >/dev/null 2>&1 || true; fi',
+                # colcon Python packages install executables to lib/<pkg>/ but
+                # don't add a PATH hook. Append AMENT package lib dirs to PATH.
+                'if [ -n "$AMENT_PREFIX_PATH" ]; then '
+                'IFS=: read -ra _ament_dirs <<< "$AMENT_PREFIX_PATH"; '
+                'for _p in "${_ament_dirs[@]}"; do '
+                'if [ -d "$_p/lib" ]; then for _d in "$_p"/lib/*/; do '
+                '[ -d "$_d" ] && PATH="$PATH:$_d"; done; fi; done; export PATH; fi',
             ])
 
         if command:
-            script_lines.append(shlex.join(command))
+            return self._exec_detached(container_id, script_lines, command)
         else:
             script_lines.append("exec bash -i")
+            cmd.append("\n".join(script_lines))
+            result = subprocess.run(cmd, check=False)
+            return result.returncode
 
-        cmd.append("\n".join(script_lines))
+    def _exec_detached(
+        self,
+        container_id: str,
+        script_lines: List[str],
+        command: List[str],
+        timeout: float = 120.0,
+    ) -> int:
+        """Execute command in container using detached docker exec.
 
-        result = subprocess.run(
-            cmd,
-            check=False,
+        Uses docker exec -d to avoid FastDDS pipe deadlock. Foreground
+        docker exec creates pipes that deadlock with DDS graph queries
+        and even ``source setup.bash`` in containers running FastDDS.
+
+        Flow: docker exec -d → poll for .rc marker → read output files.
+
+        Note: polling and output reads use foreground docker exec with
+        simple commands (test -f, cat) that do not involve DDS, so they
+        are safe from the deadlock.
+        """
+        actual_cmd = shlex.join(command)
+        exec_id = f"{os.getpid()}_{time.monotonic_ns()}"
+        tmp_prefix = f'/tmp/_karakuri_exec_{exec_id}'
+
+        # Write exit code to .rc.tmp first, then atomically rename to .rc
+        # so that `test -f .rc` only succeeds after the content is complete.
+        script_lines.append(
+            f'({actual_cmd}) >{tmp_prefix}.out 2>{tmp_prefix}.err\n'
+            f'echo $? >{tmp_prefix}.rc.tmp && mv {tmp_prefix}.rc.tmp {tmp_prefix}.rc'
         )
-        return result.returncode
+
+        detached_cmd = [
+            "docker", "exec", "-d",
+            container_id, "bash", "-lc",
+            "\n".join(script_lines),
+        ]
+        launch = subprocess.run(
+            detached_cmd, capture_output=True, text=True, check=False,
+        )
+        if launch.returncode != 0:
+            msg = launch.stderr.strip() or "unknown error"
+            print(f"Error: failed to start detached exec: {msg}", file=sys.stderr)
+            return 1
+
+        try:
+            # Poll for completion (wait for .rc file to appear)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                probe = subprocess.run(
+                    ["docker", "exec", container_id,
+                     "test", "-f", f"{tmp_prefix}.rc"],
+                    check=False,
+                )
+                if probe.returncode == 0:
+                    break
+                time.sleep(0.3)
+            else:
+                print("Error: exec timed out", file=sys.stderr)
+                return 1
+
+            # Read captured output (simple cat, no DDS involvement)
+            def _read_file(path: str) -> str:
+                r = subprocess.run(
+                    ["docker", "exec", container_id, "cat", path],
+                    capture_output=True, text=True, check=False,
+                )
+                return r.stdout
+
+            stdout_output = _read_file(f"{tmp_prefix}.out")
+            stderr_output = _read_file(f"{tmp_prefix}.err")
+            rc_output = _read_file(f"{tmp_prefix}.rc")
+
+            if stdout_output:
+                sys.stdout.write(stdout_output)
+            if stderr_output:
+                sys.stderr.write(stderr_output)
+
+            try:
+                return int(rc_output.strip())
+            except (ValueError, AttributeError):
+                return 1
+        finally:
+            # Always clean up temp files (including on timeout)
+            subprocess.run(
+                ["docker", "exec", container_id, "rm", "-f",
+                 f"{tmp_prefix}.out", f"{tmp_prefix}.err",
+                 f"{tmp_prefix}.rc", f"{tmp_prefix}.rc.tmp"],
+                capture_output=True, check=False,
+            )
 
     def _find_running_skill_container(self, skill_name: str, skill_dir: Path) -> Optional[str]:
         """Find running container ID for a skill service."""
